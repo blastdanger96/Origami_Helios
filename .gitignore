@@ -1,0 +1,10 @@
+# Project Helios
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Runtime telemetry artifacts (autosave/exported CSVs)
+helios_mission_autosave.csv
+helios_mission_export.csv
+*.log
