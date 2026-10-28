@@ -32,7 +32,14 @@ from PySide6.QtQml import QQmlApplicationEngine, qmlRegisterType  # noqa: E402
 
 from helios_backend import HeliosBackend               # noqa: E402
 from helios_charts import LiveChart                    # noqa: E402
+from helios_optimizer import HeliosOptimizerBridge     # noqa: E402
 from helios_render import SatelliteView                # noqa: E402
+from helios_render_views import (                      # noqa: E402
+    EarthOrbitView,
+    HorizonChart,
+    OptimizerSurfaceView,
+    TerminatorMap,
+)
 
 QML_DIR = Path(__file__).resolve().parent / "qml"
 
@@ -46,6 +53,10 @@ def main() -> int:
     qmlRegisterType(HeliosBackend, "Helios", 1, 0, "HeliosBackend")
     qmlRegisterType(SatelliteView, "Helios", 1, 0, "SatelliteView")
     qmlRegisterType(LiveChart, "Helios", 1, 0, "LiveChart")
+    qmlRegisterType(EarthOrbitView, "Helios", 1, 0, "EarthOrbitView")
+    qmlRegisterType(OptimizerSurfaceView, "Helios", 1, 0, "OptimizerSurfaceView")
+    qmlRegisterType(HorizonChart, "Helios", 1, 0, "HorizonChart")
+    qmlRegisterType(TerminatorMap, "Helios", 1, 0, "TerminatorMap")
 
     # The dashboard drives a single HeliosBackend instance; QML binds to it
     # through the `backend` context property (Main.qml references it from
@@ -57,6 +68,10 @@ def main() -> int:
     context = engine.rootContext()
     context.setContextProperty("backend", backend)
     context.setContextProperty("monoFont", "SF Mono")
+    # QML-facing Adam-state bridge: streams optimizer internals out of the
+    # worker thread and feeds slider commands back through queued slots.
+    optimizer = HeliosOptimizerBridge(backend)
+    context.setContextProperty("optimizer", optimizer)
 
     engine.load(QUrl.fromLocalFile(str(QML_DIR / "Main.qml")))
     if not engine.rootObjects():

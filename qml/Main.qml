@@ -23,6 +23,9 @@ Window {
     // Mission view state: 0 = TELEMETRY, 1 = ORBITAL MECHANICS, 2 = AI OPTIMIZER.
     property int viewState: 0
 
+    // Latest sampleReady payload, shared by the orbital and AI views.
+    property var lastSample: null
+
     function switchView(to) {
         if (to === viewState) return
         viewState = to
@@ -243,7 +246,7 @@ Window {
             }
         }
 
-        // ---- View 1: Orbital Mechanics (Phase 2 engine mounts here) ----- //
+        // ---- View 1: Orbital Mechanics --------------------------------- //
         Item {
             id: viewOrbit
             anchors.fill: parent
@@ -252,41 +255,36 @@ Window {
 
             Behavior on opacity { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
 
-            Rectangle {
-                anchors.centerIn: parent
-                width: 420
-                height: 96
-                radius: 16
-                color: "#990F141E"
-                border.color: "#1AFFFFFF"
-                border.width: 1
+            EarthOrbitView {
+                id: orbitView
+                anchors.fill: parent
+                sunEci: windowRoot.lastSample ? windowRoot.lastSample.sun_eci : [1.0, 0.0, 0.0]
+                anomalyDeg: windowRoot.lastSample ? windowRoot.lastSample.true_anom_deg : 0.0
+                eclipse: windowRoot.lastSample ? windowRoot.lastSample.eclipse : false
+            }
 
-                Column {
-                    anchors.centerIn: parent
-                    spacing: 6
+            MouseArea {
+                anchors.fill: parent
+                acceptedButtons: Qt.LeftButton | Qt.RightButton
 
-                    Text {
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        color: "#00E5FF"
-                        font.family: "SF Pro Display"
-                        font.pixelSize: 13
-                        font.letterSpacing: 3.0
-                        text: "ORBITAL MECHANICS"
-                    }
+                property real lastX: 0
+                property real lastY: 0
 
-                    Text {
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        color: "#62798F"
-                        font.family: "SF Mono"
-                        font.pixelSize: 10
-                        font.letterSpacing: 1.4
-                        text: "KEPLERIAN ENGINE MOUNTS IN PHASE 2"
-                    }
+                onPressed: { lastX = mouse.x; lastY = mouse.y }
+                onPositionChanged: {
+                    if (!pressed) return
+                    var dx = mouse.x - lastX
+                    var dy = mouse.y - lastY
+                    if (mouse.buttons & Qt.RightButton) orbitView.pan(dx, dy)
+                    else orbitView.orbit(dx, dy)
+                    lastX = mouse.x
+                    lastY = mouse.y
                 }
+                onWheel: (wheel) => orbitView.zoom(wheel.angleDelta.y)
             }
         }
 
-        // ---- View 2: AI Optimizer (Phase 3 landscape mounts here) ------- //
+        // ---- View 2: AI Optimizer -------------------------------------- //
         Item {
             id: viewAI
             anchors.fill: parent
@@ -295,37 +293,32 @@ Window {
 
             Behavior on opacity { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
 
-            Rectangle {
-                anchors.centerIn: parent
-                width: 420
-                height: 96
-                radius: 16
-                color: "#990F141E"
-                border.color: "#1AFFFFFF"
-                border.width: 1
+            OptimizerSurfaceView {
+                id: surfaceView
+                anchors.fill: parent
+                landscape: windowRoot.lastSample ? windowRoot.lastSample.landscape : []
+                thetaDeg: backend.theta
+                stepSizeDeg: optimizer.stepSize !== 0 ? optimizer.stepSize * 180 / Math.PI : backend.theta
+            }
 
-                Column {
-                    anchors.centerIn: parent
-                    spacing: 6
+            MouseArea {
+                anchors.fill: parent
+                acceptedButtons: Qt.LeftButton | Qt.RightButton
 
-                    Text {
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        color: "#00FF88"
-                        font.family: "SF Pro Display"
-                        font.pixelSize: 13
-                        font.letterSpacing: 3.0
-                        text: "AI OPTIMIZER"
-                    }
+                property real lastX: 0
+                property real lastY: 0
 
-                    Text {
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        color: "#62798F"
-                        font.family: "SF Mono"
-                        font.pixelSize: 10
-                        font.letterSpacing: 1.4
-                        text: "ADAM STATE VISUALIZER MOUNTS IN PHASE 3"
-                    }
+                onPressed: { lastX = mouse.x; lastY = mouse.y }
+                onPositionChanged: {
+                    if (!pressed) return
+                    var dx = mouse.x - lastX
+                    var dy = mouse.y - lastY
+                    if (mouse.buttons & Qt.RightButton) surfaceView.pan(dx, dy)
+                    else surfaceView.orbit(dx, dy)
+                    lastX = mouse.x
+                    lastY = mouse.y
                 }
+                onWheel: (wheel) => surfaceView.zoom(wheel.angleDelta.y)
             }
         }
     }
@@ -542,6 +535,7 @@ Window {
             powerChart.chart.append(sample.t, sample.power_manual, sample.power)
             thetaChart.chart.append(sample.t, sample.theta_manual, sample.theta)
             gradChart.chart.append(sample.t, sample.grad, sample.grad)
+            windowRoot.lastSample = sample
         }
     }
 
@@ -601,4 +595,268 @@ Window {
 
     // The full telemetry pump (charts + slider sync) lives in the single
     // Connections block above, bound to backend.sampleReady at 10 Hz.
+
+    // ------------------------------------------------------------------ //
+    // ORBITAL MECHANICS panels — slide in only on viewState === 1
+    // ------------------------------------------------------------------ //
+    GlassPanel {
+        id: orbitLeftPanel
+        anchors.top: header.bottom
+        anchors.left: parent.left
+        anchors.topMargin: 16
+        width: 298
+        height: orbitTelemetryCol.implicitHeight + 34
+        z: 15
+
+        opacity: windowRoot.viewState === 1 ? 1.0 : 0.0
+        Behavior on opacity { NumberAnimation { duration: 200; easing.type: Easing.OutCubic } }
+        anchors.leftMargin: windowRoot.viewState === 1 ? 16 : -340
+        Behavior on anchors.leftMargin { NumberAnimation { duration: 240; easing.type: Easing.OutCubic } }
+
+        Column {
+            id: orbitTelemetryCol
+            width: parent.width
+            spacing: 12
+
+            SectionLabel { text: "ORBITAL TELEMETRY" }
+
+            TelemetryCell {
+                label: "ALTITUDE"
+                text: (windowRoot.lastSample ? windowRoot.lastSample.alt_km : 0).toFixed(2) + " km"
+                tint: "#9BF3FF"
+            }
+
+            TelemetryCell {
+                label: "VELOCITY"
+                text: ((windowRoot.lastSample ? windowRoot.lastSample.speed_kms : 0) * 1000.0).toFixed(0) + " m/s"
+            }
+
+            TelemetryCell {
+                label: "ORBITAL PERIOD"
+                text: ((windowRoot.lastSample ? windowRoot.lastSample.period_s : 0) / 60.0).toFixed(2) + " min"
+            }
+
+            TelemetryCell {
+                label: "TRUE ANOMALY \u03BD"
+                text: ((windowRoot.lastSample ? windowRoot.lastSample.true_anom_deg : 0) % 360).toFixed(1) + "\u00B0"
+                tint: "#9BF3FF"
+            }
+
+            TelemetryCell {
+                label: "NEXT ECLIPSE IN"
+                text: {
+                    if (!windowRoot.lastSample) return "\u2014"
+                    var s = windowRoot.lastSample.next_eclipse_s
+                    return s >= 0 ? (s / 60.0).toFixed(1) + " min" : "NO ECLIPSE WINDOW"
+                }
+            }
+
+            LivePill {
+                label: (windowRoot.lastSample && windowRoot.lastSample.eclipse)
+                       ? "ECLIPSE \u2014 POWER DROP"
+                       : "SUNLIT \u2014 FULL IRRADIANCE"
+                active: !(windowRoot.lastSample && windowRoot.lastSample.eclipse)
+            }
+
+            TerminatorMap {
+                width: parent.width
+                height: 138
+                sunEci: windowRoot.lastSample ? windowRoot.lastSample.sun_eci : [1, 0, 0]
+                anomalyDeg: windowRoot.lastSample ? windowRoot.lastSample.true_anom_deg : 0
+            }
+        }
+    }
+
+    GlassPanel {
+        id: orbitRightPanel
+        anchors.top: header.bottom
+        anchors.right: parent.right
+        anchors.topMargin: 16
+        width: 298
+        height: sunTrackCol.implicitHeight + 34
+        z: 15
+
+        opacity: windowRoot.viewState === 1 ? 1.0 : 0.0
+        Behavior on opacity { NumberAnimation { duration: 200; easing.type: Easing.OutCubic } }
+        anchors.rightMargin: windowRoot.viewState === 1 ? 16 : -340
+        Behavior on anchors.rightMargin { NumberAnimation { duration: 240; easing.type: Easing.OutCubic } }
+
+        Column {
+            id: sunTrackCol
+            width: parent.width
+            spacing: 13
+
+            SectionLabel { text: "SUN TRACKING" }
+
+            HorizonChart {
+                width: parent.width
+                height: 158
+                projection: windowRoot.lastSample ? windowRoot.lastSample.projection : []
+            }
+
+            TelemetryCell {
+                label: "INCIDENCE NOW  cos\u03B8"
+                text: backend.incidence.toFixed(3)
+                tint: "#9BF3FF"
+            }
+
+            GlassSlider {
+                width: parent.width
+                from: 1; to: 100
+                label: "TIME WARP"
+                valueLabel: value.toFixed(0) + "\u00D7"
+                tint: "#FFC24D"
+                Component.onCompleted: value = backend.timeWarp
+                onSliderMoved: (val) => backend.timeWarp = val
+            }
+
+            WarpDriveToggle {
+            }
+        }
+    }
+
+    Connections {
+        target: optimizer
+
+        function onLrChanged() { if (!lrSlider.pressed) lrSlider.value = Math.log10(optimizer.lr) }
+        function onBeta1Changed() { if (!beta1Slider.pressed) beta1Slider.value = optimizer.beta1 }
+        function onBeta2Changed() { if (!beta2Slider.pressed) beta2Slider.value = optimizer.beta2 }
+        function onEpsChanged() { if (!epsSlider.pressed) epsSlider.value = Math.log10(optimizer.epsilon) }
+    }
+
+    // ------------------------------------------------------------------ //
+    // AI OPTIMIZER panels — slide in only on viewState === 2
+    // ------------------------------------------------------------------ //
+    GlassPanel {
+        id: aiLeftPanel
+        anchors.top: header.bottom
+        anchors.left: parent.left
+        anchors.topMargin: 16
+        width: 298
+        height: aiStateCol.implicitHeight + 34
+        z: 15
+
+        opacity: windowRoot.viewState === 2 ? 1.0 : 0.0
+        Behavior on opacity { NumberAnimation { duration: 200; easing.type: Easing.OutCubic } }
+        anchors.leftMargin: windowRoot.viewState === 2 ? 16 : -340
+        Behavior on anchors.leftMargin { NumberAnimation { duration: 240; easing.type: Easing.OutCubic } }
+
+        Column {
+            id: aiStateCol
+            width: parent.width
+            spacing: 12
+
+            SectionLabel { text: "OPTIMIZATION STATE" }
+
+            OptimizerNodeGraph {
+                width: parent.width
+                height: 152
+            }
+
+            TelemetryCell {
+                label: "LEARNING RATE"
+                text: optimizer.sci(optimizer.lr)
+                tint: "#00E5FF"
+            }
+
+            TelemetryCell {
+                label: "GRADIENT  dP/d\u03B8"
+                text: optimizer.sci(Math.abs(optimizer.thetaGrad)) + " W/rad"
+            }
+
+            TelemetryCell {
+                label: "ADAM MOMENTUM  |m|"
+                text: optimizer.momentum.toFixed(4)
+                tint: "#9BF3FF"
+            }
+
+            TelemetryCell {
+                label: "ADAM VARIANCE  \u221Av"
+                text: Math.sqrt(Math.max(0, optimizer.variance)).toExponential(2)
+            }
+
+            TelemetryCell {
+                label: "STEP  d\u03B8/cmd"
+                text: optimizer.fmtDeg(optimizer.stepSize) + "\u00B0"
+                tint: "#9BF3FF"
+            }
+
+            LivePill {
+                label: optimizer.settled ? "SETTLED \u2014 ZERO GRADIENT" :"DESCENDING GRADIENT"
+                active: !optimizer.settled
+            }
+        }
+    }
+
+    GlassPanel {
+        id: aiRightPanel
+        anchors.top: header.bottom
+        anchors.right: parent.right
+        anchors.topMargin: 16
+        width: 298
+        height: hyperCol.implicitHeight + 34
+        z: 15
+
+        opacity: windowRoot.viewState === 2 ? 1.0 : 0.0
+        Behavior on opacity { NumberAnimation { duration: 200; easing.type: Easing.OutCubic } }
+        anchors.rightMargin: windowRoot.viewState === 2 ? 16 : -340
+        Behavior on anchors.rightMargin { NumberAnimation { duration: 240; easing.type: Easing.OutCubic } }
+
+        Column {
+            id: hyperCol
+            width: parent.width
+            spacing: 13
+
+            SectionLabel { text: "HYPERPARAMETERS" }
+
+            GlassSlider {
+                id: lrSlider
+                width: parent.width
+                from: -6; to: 0
+                label: "LEARNING RATE \u03B7"
+                valueLabel: Math.pow(10, value).toExponential(1)
+                tint: "#00E5FF"
+                Component.onCompleted: value = Math.log10(optimizer.lr)
+                onSliderMoved: (val) => optimizer.setLearningRate(Math.pow(10, val))
+            }
+
+            GlassSlider {
+                id: beta1Slider
+                width: parent.width
+                from: 0; to: 0.99
+                label: "BETA 1  \u03B2\u2081"
+                valueLabel: value.toFixed(4)
+                tint: "#00E5FF"
+                Component.onCompleted: value = optimizer.beta1
+                onSliderMoved: (val) => optimizer.setBeta1(val)
+            }
+
+            GlassSlider {
+                id: beta2Slider
+                width: parent.width
+                from: 0.9; to: 0.999
+                label: "BETA 2  \u03B2\u2082"
+                valueLabel: value.toFixed(5)
+                tint: "#00E5FF"
+                Component.onCompleted: value = optimizer.beta2
+                onSliderMoved: (val) => optimizer.setBeta2(val)
+            }
+
+            GlassSlider {
+                id: epsSlider
+                width: parent.width
+                from: -12; to: -1
+                label: "EPSILON  \u03B5"
+                valueLabel: Math.pow(10, value).toExponential(1)
+                tint: "#00E5FF"
+                Component.onCompleted: value = Math.log10(Math.max(optimizer.epsilon, 1e-12))
+                onSliderMoved: (val) => optimizer.setEpsilon(Math.pow(10, val))
+            }
+
+            TelemetryCell {
+                label: "LIVE  \u03B7"
+                text: optimizer.sci(optimizer.lr)
+            }
+        }
+    }
 }

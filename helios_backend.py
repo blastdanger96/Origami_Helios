@@ -84,6 +84,7 @@ from PySide6.QtCore import (
     Slot,
 )
 
+from helios_orbit import OrbitSim
 from helios_physics import DEFAULT_EFFICIENCY, SolarArrayModel
 
 TICK_MS = 100
@@ -106,6 +107,12 @@ ORBIT_EL_SWING_DEG = 20.0
 
 # A manual sun move beyond this angle restarts the Adam moment state.
 SUN_JUMP_RESET_DEG = 2.0
+
+# AI Optimizer view cadences: the 91-point landscape sweep and the 90-minute
+# projection both cost a few ms and refresh at ~1 Hz of wall time.
+LANDSCAPE_POINTS = 91
+LANDSCAPE_REFRESH_TICKS = 10
+PROJECTION_REFRESH_TICKS = 10
 
 TRAIL_SAMPLES = 20
 CSV_INTERVAL_S = 1.0
@@ -174,6 +181,21 @@ class HeliosWorker(QObject):
         self._timer = None
         self._trail: deque[tuple[float, float]] = deque(maxlen=TRAIL_SAMPLES)
         self.last_event: dict | None = None
+        # Keplerian mission sim (helios_orbit): drives the dynamic sun vector
+        # and the eclipse state in orbit mode.  Pure math, no Qt objects.
+        self.orbit_sim = OrbitSim()
+        self.orbit_state = self.orbit_sim.state_at(0.0)
+        self.time_warp = 1.0
+        self._base_solar = model.solar_constant
+        # Adam internals + per-tick progress for the AI Optimizer view.
+        self._adam_m = 0.0
+        self._adam_v = 0.0
+        self._adam_g = 0.0
+        self._adam_lr = LEARNING_RATE
+        self._dtheta = 0.0
+        self._tick_count = 0
+        self._landscape_powers: list[float] = []
+        self._projection: list[float] = []
         # 1 Hz CSV recorder (kept in the worker thread, off the GUI).
         self._csv_rows: list[list] = []
         self._last_csv_t = -1.0
@@ -227,6 +249,44 @@ class HeliosWorker(QObject):
             self.optimizer = self._make_optimizer()
 
     @Slot(float)
+    def set_time_warp(self, warp: float) -> None:
+        """Orbital simulation speed multiplier (1x..100x)."""
+        self.time_warp = max(1.0, min(100.0, float(warp)))
+
+    @Slot(float)
+    def set_lr(self, value: float) -> None:
+        """Live learning-rate update; Adam moment tensors are preserved."""
+        self._set_adam_hparams(lr=value)
+
+    @Slot(float, float)
+    def set_betas(self, beta1: float, beta2: float) -> None:
+        self._set_adam_hparams(beta1=beta1, beta2=beta2)
+
+    @Slot(float)
+    def set_eps(self, value: float) -> None:
+        self._set_adam_hparams(eps=value)
+
+    def _set_adam_hparams(
+        self,
+        lr: float | None = None,
+        beta1: float | None = None,
+        beta2: float | None = None,
+        eps: float | None = None,
+    ) -> None:
+        group = self.optimizer.param_groups[0]
+        lr = group["lr"] if lr is None else max(1e-8, float(lr))
+        betas = group["betas"]
+        beta1 = betas[0] if beta1 is None else max(0.0, min(0.9995, float(beta1)))
+        beta2 = betas[1] if beta2 is None else max(0.0, min(0.99999, float(beta2)))
+        eps = group["eps"] if eps is None else max(1e-12, float(eps))
+        rebuilt = torch.optim.Adam([self.z], lr=lr, betas=(beta1, beta2), eps=eps)
+        # Same parameter instance -> the moment tensors carry over untouched.
+        # Live hyperparameter edits must never reset the filter state.
+        rebuilt.state = self.optimizer.state
+        self.optimizer = rebuilt
+        self._adam_lr = lr
+
+    @Slot(float)
     def set_manual_theta(self, theta_rad: float) -> None:
         if self.autopilot:
             return
@@ -250,8 +310,12 @@ class HeliosWorker(QObject):
             return
         self.orbit = bool(enabled)
         if enabled:
-            # Baseline for the sweep is whatever the sliders show right now.
+            # Restart the mission clock from apogee-consistent t=0 (perigee).
             self.t_lvlh = 0.0
+        else:
+            # Leaving orbit mid-eclipse must never keep the array dark.
+            self._model.solar_constant = self._base_solar
+            self.orbit_state = self.orbit_sim.state_at(self.t_lvlh)
 
     # -- derived values ----------------------------------------------------- #
 
@@ -273,13 +337,23 @@ class HeliosWorker(QObject):
     def _current_sun(self) -> tuple[torch.Tensor, float, float]:
         """Sun angles for this tick, applying the LVLH sweep in orbit mode."""
         if self.orbit:
-            t = self.t_lvlh
-            az = _wrap_degrees(self.sun_azimuth + ORBIT_RATE_DEG_S * t)
-            el = _clip_el_degrees(
-                self.sun_elevation
-                + ORBIT_EL_SWING_DEG * math.sin(2.0 * math.pi * t / ORBIT_PERIOD_S)
+            state = self.orbit_sim.state_at(self.t_lvlh)
+            self.orbit_state = state
+            # Eclipse gate: penumbra-free shadow -> zero irradiance.  The
+            # objective becomes exactly flat (autograd grad == 0 to within
+            # float64 eps) and the controller simply holds position until
+            # sunrise - there is no direction to push in the dark.
+            self._model.solar_constant = (
+                0.0 if state.eclipse else self._base_solar
             )
-            return sun_vector_from_angles(az, el), az, el
+            # Heavy subscriptions (90-min projection) refresh at ~1 Hz of
+            # wall time instead of every tick.
+            if self._tick_count % PROJECTION_REFRESH_TICKS == 0:
+                self._projection = self.orbit_sim.incidence_projection(
+                    self.t_lvlh
+                )
+            self.t_lvlh += TICK_MS / 1000.0 * self.time_warp
+            return state.sun_body, state.sun_az_deg, state.sun_el_deg
         return (
             sun_vector_from_angles(self.sun_azimuth, self.sun_elevation),
             self.sun_azimuth,
@@ -290,8 +364,7 @@ class HeliosWorker(QObject):
 
     @Slot()
     def _tick(self) -> None:
-        if self.orbit:
-            self.t_lvlh += TICK_MS / 1000.0
+        self._tick_count += 1
         sun, sun_az, sun_el = self._current_sun()
 
         # Event detection: a *manual* jump of the sliders, not the slow
@@ -310,8 +383,16 @@ class HeliosWorker(QObject):
         self._prev_sun_az = sun_az
         self._prev_sun_el = sun_el
 
+        theta_before = self.theta_value
         grad_norm = self._optimize(sun)
         theta_auto = self.theta_value
+        self._dtheta = theta_auto - theta_before
+        # Adam internals for the AI Optimizer view: single-param scalars.
+        state = self.optimizer.state.get(self.z)
+        if state is not None and "exp_avg" in state:
+            self._adam_m = float(state["exp_avg"].abs().item())
+            self._adam_v = float(state["exp_avg_sq"].abs().item())
+            self._adam_lr = float(self.optimizer.param_groups[0]["lr"])
         theta_array = theta_auto if self.autopilot else self.manual_theta
 
         auto = self.model.measure(theta_auto, sun)
@@ -346,13 +427,43 @@ class HeliosWorker(QObject):
             "power": array.power,
             "advantage": auto_power - manual_power,
             "grad": grad_norm,
+            "z_grad": self._adam_g,
             "autopilot": self.autopilot,
             "orbit": self.orbit,
             "t_lvlh": self.t_lvlh,
+            "alt_km": self.orbit_state.altitude_km if self.orbit else 0.0,
+            "speed_kms": self.orbit_state.speed_km_s if self.orbit else 0.0,
+            "eclipse": self.orbit_state.eclipse if self.orbit else False,
+            "period_s": self.orbit_state.period_s,
+            "next_eclipse_s": (
+                self.orbit_state.next_eclipse_s if self.orbit else -1.0
+            ),
+            "time_warp": self.time_warp,
+            "adam_lr": self._adam_lr,
+            "adam_m": self._adam_m,
+            "adam_v": self._adam_v,
+            "dtheta": self._dtheta,
+            "projection": list(self._projection) if self.orbit else [],
+            "landscape": list(self._landscape_powers),
+            "sun_eci": (
+                list(self.orbit_state.sun_eci)
+                if self.orbit
+                else [0.0, 0.0, 0.0]
+            ),
+            "pos_lvlh": (
+                list(self.orbit_state.pos_lvlh_km)
+                if self.orbit
+                else [0.0, 0.0, 1.0]
+            ),
+            "true_anom_deg": (
+                self.orbit_state.true_anomaly_deg if self.orbit else 0.0
+            ),
             "trail": list(self._trail),
             "events": [self.last_event] if self.last_event is not None else [],
         }
         self.last_event = None
+        if self._tick_count % LANDSCAPE_REFRESH_TICKS == 0:
+            self._sweep_landscape()
         self.sample.emit(payload)
 
         self._csv_tick(payload)
@@ -375,6 +486,7 @@ class HeliosWorker(QObject):
         loss.backward()
         grad = self.z.grad
         latent_step = float(grad.abs().item()) if grad is not None else 0.0
+        self._adam_g = latent_step
 
         for step in range(STEPS_PER_TICK):
             if step > 0:
@@ -387,6 +499,23 @@ class HeliosWorker(QObject):
         # physical dP/dtheta the telemetry chart expects.
         dtheta_dz = THETA_MID * (1.0 - math.tanh(float(self.z.detach())) ** 2)
         return latent_step * dtheta_dz
+
+    # -- landscape / projection ------------------------------------------------------------------------------ #
+
+    def _sweep_landscape(self) -> None:
+        """91-point P(theta) power scan for the AI Optimizer surface view.
+
+        ~1 Hz cadence (LANDSCAPE_REFRESH_TICKS); each point uses the
+        autograd-free ``measure`` so the sweep never touches the graph.
+        """
+        if self.orbit:
+            sun = self.orbit_state.sun_body
+        else:
+            sun = sun_vector_from_angles(self.sun_azimuth, self.sun_elevation)
+        self._landscape_powers = [
+            self.model.measure(math.radians(90.0 * i / (LANDSCAPE_POINTS - 1)), sun).power
+            for i in range(LANDSCAPE_POINTS)
+        ]
 
     # -- CSV telemetry ------------------------------------------------------- #
 
@@ -474,8 +603,13 @@ class HeliosBackend(QObject):
     incidenceChanged = Signal()
     sampleReady = Signal("QVariantMap")
     csvExported = Signal(str)
+    timeWarpChanged = Signal()
 
     _sunRequested = Signal(float, float)
+    _warpRequested = Signal(float)
+    _lrRequested = Signal(float)
+    _betasRequested = Signal(float, float)
+    _epsRequested = Signal(float)
     _manualRequested = Signal(float)
     _modeRequested = Signal(bool)
     _orbitRequested = Signal(bool)
@@ -501,6 +635,7 @@ class HeliosBackend(QObject):
         self._incidence = 0.0
         self._autopilot = True
         self._orbit = False
+        self._time_warp = 1.0
 
         self._thread = QThread()
         self._thread.setObjectName("helios-optimizer")
@@ -513,6 +648,10 @@ class HeliosBackend(QObject):
         self._manualRequested.connect(self._worker.set_manual_theta)
         self._modeRequested.connect(self._worker.set_autopilot)
         self._orbitRequested.connect(self._worker.set_orbit)
+        self._warpRequested.connect(self._worker.set_time_warp)
+        self._lrRequested.connect(self._worker.set_lr)
+        self._betasRequested.connect(self._worker.set_betas)
+        self._epsRequested.connect(self._worker.set_eps)
         self._shutdownRequested.connect(self._worker.stop)
         self._thread.start()
 
@@ -579,6 +718,19 @@ class HeliosBackend(QObject):
         self.autopilotChanged.emit()
         self._modeRequested.emit(enabled)
 
+    @Property(float, notify=timeWarpChanged)
+    def timeWarp(self) -> float:
+        return self._time_warp
+
+    @timeWarp.setter
+    def timeWarp(self, value: float) -> None:
+        value = max(1.0, min(100.0, float(value)))
+        if abs(value - self._time_warp) < 1e-9:
+            return
+        self._time_warp = value
+        self.timeWarpChanged.emit()
+        self._warpRequested.emit(value)
+
     @Property(bool, notify=orbitChanged)
     def orbitMode(self) -> bool:
         return self._orbit
@@ -629,6 +781,23 @@ class HeliosBackend(QObject):
     def solarConstant(self) -> float:
         return SOLAR_CONSTANT
 
+    # -- AI Optimizer hyperparameter bridge (slots, thread-queued) ----------- #
+
+    @Slot(float)
+    def setAdamLr(self, value: float) -> None:
+        self._lrRequested.emit(max(1e-8, float(value)))
+
+    @Slot(float, float)
+    def setAdamBetas(self, beta1: float, beta2: float) -> None:
+        self._betasRequested.emit(
+            max(0.0, min(0.9995, float(beta1))),
+            max(0.0, min(0.99999, float(beta2))),
+        )
+
+    @Slot(float)
+    def setAdamEps(self, value: float) -> None:
+        self._epsRequested.emit(max(1e-12, float(value)))
+
     # -- telemetry ---------------------------------------------------------- #
 
     @Slot(object)
@@ -675,6 +844,22 @@ class HeliosBackend(QObject):
                 "trail": [
                     [float(row[0]), float(row[1])] for row in data["trail"]
                 ],
+                "alt_km": float(data["alt_km"]),
+                "speed_kms": float(data["speed_kms"]),
+                "eclipse": bool(data["eclipse"]),
+                "period_s": float(data["period_s"]),
+                "next_eclipse_s": float(data["next_eclipse_s"]),
+                "sun_eci": [float(v) for v in data["sun_eci"]],
+                "pos_lvlh": [float(v) for v in data["pos_lvlh"]],
+                "true_anom_deg": float(data["true_anom_deg"]),
+                "projection": [float(v) for v in data["projection"]],
+                "landscape": [float(v) for v in data["landscape"]],
+                "adam_lr": float(data["adam_lr"]),
+                "adam_m": float(data["adam_m"]),
+                "adam_v": float(data["adam_v"]),
+                "theta_grad": float(data["grad"]),
+                "z_grad": float(data["z_grad"]),
+                "dtheta": float(data["dtheta"]),
                 "autopilot": bool(data["autopilot"]),
             }
         )
